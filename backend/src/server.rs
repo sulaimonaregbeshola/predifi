@@ -10,6 +10,7 @@
 //! inherit the same trace id.
 
 use crate::config::Config;
+use crate::contract_identity::{self, ContractIdentityStatus};
 use crate::metrics::{Metrics, SharedMetrics};
 use crate::request_logger::LoggingLayer;
 use crate::shutdown;
@@ -268,6 +269,32 @@ async fn root() -> Json<serde_json::Value> {
     Json(json!({ "message": "Welcome to the PrediFi backend", "api": "/api/v1" }))
 }
 
+/// Diagnostic endpoint exposing the result of the contract-identity check.
+///
+/// Operators (and the frontend) can use this to distinguish "the backend is
+/// pointed at an unexpected contract" from a genuine chain outage. When the
+/// status is not `Verified`, all mutation endpoints are disabled.
+async fn contract_identity(
+    State(state): State<crate::routes::v1::AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    let status = state.contract_identity.status();
+    let body = json!({
+        "status": status.label(),
+        "verified": status.is_verified(),
+        "mutations_enabled": status.mutations_enabled(),
+        "diagnostic": status.diagnostic(),
+    });
+
+    let code = if status.is_verified() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body)).into_response()
+}
+
 async fn metrics_handler(State(state): State<crate::routes::v1::AppState>) -> impl IntoResponse {
     match state.metrics.gather_text() {
         Ok(body) => (
@@ -365,6 +392,8 @@ pub fn build_router_with_rate_limit(
         std::process::exit(1);
     }));
 
+    let identity = contract_identity::ContractIdentity::from_config(&config);
+
     let state = crate::routes::v1::AppState {
         config: Arc::new(config.clone()),
         cache: cache.clone(),
@@ -376,6 +405,7 @@ pub fn build_router_with_rate_limit(
         db: None,
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
+        contract_identity: identity.clone(),
     };
 
     let router = Router::new()
@@ -385,6 +415,7 @@ pub fn build_router_with_rate_limit(
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/readiness", get(readiness))
+        .route("/contract-identity", get(contract_identity))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .nest(
@@ -418,6 +449,8 @@ fn build_router_with_db(
     event_bus: crate::ws::EventBus,
     prometheus_metrics: SharedMetrics,
 ) -> Router {
+    let identity = contract_identity::ContractIdentity::from_config(&config);
+
     let state = crate::routes::v1::AppState {
         config: Arc::new(config.clone()),
         cache: cache.clone(),
@@ -429,6 +462,7 @@ fn build_router_with_db(
         db: Some(pool.clone()),
         metrics: prometheus_metrics.clone(),
         event_bus: event_bus.clone(),
+        contract_identity: identity.clone(),
     };
 
     let router = Router::new()
@@ -438,6 +472,7 @@ fn build_router_with_db(
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/readiness", get(readiness))
+        .route("/contract-identity", get(contract_identity))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .nest(
@@ -531,6 +566,28 @@ where
              replica counts, or raise the database connection limit."
         );
         std::process::exit(1);
+    }
+
+    // Verify the configured contract identity against the pinned deployment
+    // manifest before serving any traffic. A mismatch disables mutations but
+    // keeps read-only endpoints available, and surfaces a diagnostic on
+    // `/contract-identity` and in the logs.
+    let identity = contract_identity::ContractIdentity::from_config(&config);
+    let identity_status = identity.status();
+    if identity_status.is_verified() {
+        info!(
+            contract_id = %config.contract_id,
+            network = %config.network,
+            "contract identity verified against pinned deployment manifest"
+        );
+    } else {
+        error!(
+            contract_id = %config.contract_id,
+            network = %config.network,
+            status = identity_status.label(),
+            diagnostic = identity_status.diagnostic().unwrap_or("unknown"),
+            "contract identity verification failed; mutation endpoints are disabled"
+        );
     }
 
     let pool = crate::db::create_pool(&config)
@@ -725,5 +782,64 @@ mod tests {
         let _layer_a = build_cors(&cfg_a);
         let _layer_b = build_cors(&cfg_b);
         assert_ne!(cfg_a.cors_allowed_origins, cfg_b.cors_allowed_origins);
+    }
+
+    // ── Contract identity ────────────────────────────────────────────────────
+
+    fn identity_config(contract_id: &str, network: &str) -> Config {
+        let mut cfg = Config::default_for_test();
+        cfg.contract_id = contract_id.to_string();
+        cfg.network = network.to_string();
+        cfg
+    }
+
+    #[test]
+    fn contract_identity_matching_manifest_verifies() {
+        let cfg = identity_config("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM", "testnet");
+        let identity = contract_identity::ContractIdentity::from_config(&cfg);
+        let status = identity.status();
+        assert!(status.is_verified(), "diagnostic: {:?}", status.diagnostic());
+        assert!(status.mutations_enabled());
+    }
+
+    #[test]
+    fn contract_identity_mismatched_contract_disables_mutations() {
+        let cfg = identity_config("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "testnet");
+        let identity = contract_identity::ContractIdentity::from_config(&cfg);
+        let status = identity.status();
+        assert!(!status.is_verified());
+        assert!(!status.mutations_enabled());
+        assert!(status.diagnostic().is_some());
+    }
+
+    #[test]
+    fn contract_identity_unavailable_manifest_disables_mutations() {
+        let mut cfg = identity_config("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM", "testnet");
+        cfg.contract_manifest_path = Some("/nonexistent/manifest.json".to_string());
+        let identity = contract_identity::ContractIdentity::from_config(&cfg);
+        let status = identity.status();
+        assert!(!status.is_verified());
+        assert!(!status.mutations_enabled());
+        assert!(status.diagnostic().is_some());
+    }
+
+    #[test]
+    fn contract_identity_stale_manifest_disables_mutations() {
+        let mut cfg = identity_config("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM", "testnet");
+        cfg.contract_manifest_max_age_secs = Some(0);
+        let identity = contract_identity::ContractIdentity::from_config(&cfg);
+        let status = identity.status();
+        assert!(!status.is_verified());
+        assert!(!status.mutations_enabled());
+        assert!(status.diagnostic().is_some());
+    }
+
+    #[test]
+    fn contract_identity_never_falls_back_to_unverified_contract() {
+        // A mismatch must never silently resolve to the configured contract.
+        let cfg = identity_config("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "testnet");
+        let identity = contract_identity::ContractIdentity::from_config(&cfg);
+        assert_eq!(identity.status(), ContractIdentityStatus::Mismatched);
+        assert!(!identity.status().mutations_enabled());
     }
 }

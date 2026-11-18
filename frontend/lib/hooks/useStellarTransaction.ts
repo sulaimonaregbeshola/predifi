@@ -29,6 +29,7 @@ import {
   removePersistedStellarTransaction,
   setPersistedStellarTransaction,
 } from "@/lib/stellarTransactionStorage";
+import { useNetworkGuard } from "@/lib/hooks/useNetworkGuard";
 
 export type StellarTxStatus = "idle" | "running" | "confirmed" | "ambiguous" | "failed";
 
@@ -47,6 +48,14 @@ export interface UseStellarTransactionOptions<TParams> {
   createIntent?: (params: TParams) => TransactionIntent<TParams>;
   /** Restore and persist this wallet's transaction state. Defaults to true. */
   persistTransaction?: boolean;
+  /**
+   * When the configured contract identity does not match the pinned
+   * deployment manifest, mutations must be disabled. Defaults to the
+   * shared network guard's verdict.
+   */
+  mutationsDisabled?: boolean;
+  /** Diagnostic surfaced when mutations are disabled. */
+  identityDiagnostic?: WalletError;
 }
 
 export interface UseStellarTransactionResult<TParams> {
@@ -59,6 +68,8 @@ export interface UseStellarTransactionResult<TParams> {
   /** True when the caller must ask the user before retrying. */
   requiresUserConfirmation: boolean;
   accountState: AccountState | null;
+  /** True when contract identity is unverified; mutations are blocked. */
+  mutationsDisabled: boolean;
   /** Run the action, creating a fresh intent. */
   run: (params: TParams) => Promise<TransactionRunResult<TParams>>;
   /** Retry an ambiguous outcome after explicit user confirmation. */
@@ -89,6 +100,16 @@ export function useStellarTransaction<TParams>(
     persistTransaction = true,
   } = options;
   const refreshAccountState = options.refreshAccountState ?? refreshAccountSequence;
+
+  // Contract identity guard: a mismatch (or unavailable/stale manifest)
+  // disables mutations and surfaces a diagnostic through `error`.
+  const guard = useNetworkGuard();
+  const mutationsDisabled = options.mutationsDisabled ?? guard.mutationsDisabled;
+  const identityDiagnostic = options.identityDiagnostic ?? guard.diagnostic;
+  const mutationsDisabledRef = useRef(mutationsDisabled);
+  mutationsDisabledRef.current = mutationsDisabled;
+  const identityDiagnosticRef = useRef(identityDiagnostic);
+  identityDiagnosticRef.current = identityDiagnostic;
 
   const [status, setStatus] = useState<StellarTxStatus>("idle");
   const [hash, setHash] = useState<string>();
@@ -182,6 +203,24 @@ export function useStellarTransaction<TParams>(
       txIntent: TransactionIntent<TParams>,
       userConfirmedRetry: boolean,
     ): Promise<TransactionRunResult<TParams>> => {
+      // Refuse to submit while the contract identity is unverified.
+      if (mutationsDisabledRef.current) {
+        const diagnostic = identityDiagnosticRef.current;
+        const blocked: TransactionRunResult<TParams> = {
+          status: "failed",
+          intent: txIntent,
+          error: diagnostic,
+          requiresUserConfirmation: false,
+          accountState: null,
+        };
+        if (mountedRef.current) {
+          setStatus("failed");
+          setError(diagnostic);
+          setRequiresUserConfirmation(false);
+        }
+        return blocked;
+      }
+
       const executionAddress = address;
       const executionIdentity = identityKey;
       intentRef.current = txIntent;
@@ -282,10 +321,25 @@ export function useStellarTransaction<TParams>(
         return Promise.reject(new Error("Connect your wallet before submitting."));
       }
 
+      // Block new mutations when the contract identity is unverified.
+      if (mutationsDisabled) {
+        const diagnostic = identityDiagnostic;
+        if (diagnostic) {
+          setError(diagnostic);
+        }
+        return Promise.reject(
+          diagnostic
+            ? Object.assign(new Error(diagnostic.message), { walletError: diagnostic })
+            : new Error(
+                "Contract identity could not be verified. Mutations are disabled.",
+              ),
+        );
+      }
+
       const txIntent = (createIntent ?? defaultIntent)(params);
       return startExecution(txIntent, false);
     },
-    [address, status, createIntent, startExecution],
+    [address, status, createIntent, startExecution, mutationsDisabled, identityDiagnostic],
   );
 
   const confirmRetry = useCallback(() => {
@@ -299,8 +353,17 @@ export function useStellarTransaction<TParams>(
       return Promise.resolve(null);
     }
 
+    // A confirmed retry is still a mutation; block it on identity mismatch.
+    if (mutationsDisabled) {
+      const diagnostic = identityDiagnostic;
+      if (diagnostic) {
+        setError(diagnostic);
+      }
+      return Promise.resolve(null);
+    }
+
     return startExecution(txIntent, true);
-  }, [intent, startExecution]);
+  }, [intent, startExecution, mutationsDisabled, identityDiagnostic]);
 
   const reset = useCallback(() => {
     if (persistTransaction && address) {
@@ -316,18 +379,38 @@ export function useStellarTransaction<TParams>(
     setAccountState(null);
   }, [address, network, persistTransaction]);
 
+  // Surface the identity diagnostic through the existing error banner while
+  // idle, without clobbering a real transaction error.
+  const surfacedError = useMemo<WalletError | undefined>(() => {
+    if (error) return error;
+    if (mutationsDisabled && identityDiagnostic) return identityDiagnostic;
+    return undefined;
+  }, [error, mutationsDisabled, identityDiagnostic]);
+
   return useMemo(
     () => ({
       status,
       hash,
-      error,
+      error: surfacedError,
       intent,
       requiresUserConfirmation,
       accountState,
+      mutationsDisabled,
       run,
       confirmRetry,
       reset,
     }),
-    [status, hash, error, intent, requiresUserConfirmation, accountState, run, confirmRetry, reset],
+    [
+      status,
+      hash,
+      surfacedError,
+      intent,
+      requiresUserConfirmation,
+      accountState,
+      mutationsDisabled,
+      run,
+      confirmRetry,
+      reset,
+    ],
   );
 }

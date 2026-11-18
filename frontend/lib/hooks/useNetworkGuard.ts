@@ -2,6 +2,10 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { classifyWalletError } from "@/lib/walletErrors";
+import {
+  verifyContractIdentity,
+  type ContractIdentityDiagnostic,
+} from "@/lib/deploymentManifest";
 
 /** Stellar / Soroban — no canonical EVM chain for this app.
  *  Set to the chain you actually target; null means "any chain is wrong
@@ -27,6 +31,28 @@ export interface NetworkMismatchError {
   message: string;
 }
 
+/** Diagnostic describing why the configured contract identity could not be
+ *  verified against the pinned deployment manifest. */
+export interface ContractIdentityDiagnostic {
+  /** Machine-readable reason code. */
+  code:
+    | "manifest-unavailable"
+    | "manifest-stale"
+    | "contract-mismatch"
+    | "network-mismatch"
+    | "interface-unsupported";
+  /** Human-readable explanation surfaced to the user. */
+  message: string;
+  /** Contract ID the app is configured with (if any). */
+  configuredContractId: string | null;
+  /** Contract ID pinned in the manifest (if any). */
+  expectedContractId: string | null;
+  /** Network the app is configured for. */
+  configuredNetwork: string | null;
+  /** Network pinned in the manifest (if any). */
+  expectedNetwork: string | null;
+}
+
 export interface NetworkGuardState {
   /** True when wallet is connected on the wrong chain. */
   isWrongNetwork: boolean;
@@ -40,6 +66,13 @@ export interface NetworkGuardState {
   expectedContractEnv: string;
   /** True while a mismatch persists — economic actions must stay disabled. */
   isEconomicActionDisabled: boolean;
+  /** True when the configured contract identity could not be verified against
+   *  the pinned deployment manifest. Mutations must stay disabled. */
+  isContractIdentityInvalid: boolean;
+  /** Diagnostic for the contract identity failure, or null when verified. */
+  contractIdentityDiagnostic: ContractIdentityDiagnostic | null;
+  /** True when any guard condition (network or contract identity) disables mutations. */
+  isMutationDisabled: boolean;
   /** Trigger the programmatic network switch; resolves when done or rejects on user cancel. */
   switchNetwork: () => Promise<void>;
   /** Re-read the wallet's current chain and update mismatch state. */
@@ -79,21 +112,55 @@ export function useNetworkGuard(): NetworkGuardState {
   const [switchRecoveryAction, setSwitchRecoveryAction] = useState<
     string | null
   >(null);
+  const [contractIdentityDiagnostic, setContractIdentityDiagnostic] =
+    useState<ContractIdentityDiagnostic | null>(null);
+
+  /** Verify the configured contract identity against the pinned manifest.
+   *  Never falls back to an unverified contract: on any failure the
+   *  diagnostic is set and mutations stay disabled. */
+  const verifyIdentity = useCallback(async () => {
+    try {
+      const diagnostic = await verifyContractIdentity();
+      setContractIdentityDiagnostic(diagnostic);
+    } catch {
+      // A thrown verification is treated as an unavailable manifest rather
+      // than silently trusting the configured contract.
+      setContractIdentityDiagnostic({
+        code: "manifest-unavailable",
+        message:
+          "Deployment manifest could not be loaded. Contract identity is unverified.",
+        configuredContractId: null,
+        expectedContractId: null,
+        configuredNetwork: null,
+        expectedNetwork: null,
+      });
+    }
+  }, []);
 
   useEffect(() => {
+    // Verify on startup regardless of wallet presence.
+    void verifyIdentity();
+
     const eth = window.ethereum;
     if (!eth) return;
 
     eth.request({ method: "eth_chainId" }).then(setCurrentChainId).catch(() => {});
 
-    const handler = (chainId: string) => setCurrentChainId(chainId);
+    const handler = (chainId: string) => {
+      setCurrentChainId(chainId);
+      // Re-verify contract identity on every network change.
+      void verifyIdentity();
+    };
     eth.on("chainChanged", handler);
     return () => eth.removeListener("chainChanged", handler);
-  }, []);
+  }, [verifyIdentity]);
 
   const isWrongNetwork =
     currentChainId !== null &&
     currentChainId.toLowerCase() !== REQUIRED_CHAIN_ID.toLowerCase();
+
+  const isContractIdentityInvalid = contractIdentityDiagnostic !== null;
+  const isMutationDisabled = isWrongNetwork || isContractIdentityInvalid;
 
   /** Poll the provider until it reports the expected chain or we time out.
    *  Some wallets resolve `wallet_switchEthereumChain` before `eth_chainId`
@@ -216,7 +283,10 @@ export function useNetworkGuard(): NetworkGuardState {
     currentChainName: currentChainId ? chainName(currentChainId) : "",
     expectedNetwork: REQUIRED_CHAIN_NAME,
     expectedContractEnv: EXPECTED_CONTRACT_ENV,
-    isEconomicActionDisabled: isWrongNetwork,
+    isEconomicActionDisabled: isMutationDisabled,
+    isContractIdentityInvalid,
+    contractIdentityDiagnostic,
+    isMutationDisabled,
     switchNetwork,
     recheckNetwork,
     switchError,

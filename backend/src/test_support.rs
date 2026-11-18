@@ -5,7 +5,11 @@
 
 mod mock_rpc;
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use testcontainers::runners::AsyncRunner;
@@ -16,6 +20,102 @@ use crate::price_cache::PriceCache;
 use crate::redis_cache::RedisCache;
 
 pub use mock_rpc::MockRpcServer;
+
+/// Injectable clock abstraction used by domain tests to make time-dependent
+/// decisions deterministic.
+///
+/// # Deadline authority
+///
+/// Each deadline in the system has exactly one authoritative component. Tests
+/// must drive that component's clock; other components only observe the
+/// resulting state.
+///
+/// | Deadline | Authoritative component |
+/// | --- | --- |
+/// | Auth challenge expiry | Backend session store (server clock) |
+/// | JWT `exp` / `iat` | Backend token issuer (server clock) |
+/// | Quote freshness | Backend quote service (server clock) |
+/// | Pool close time | On-chain ledger close time (Stellar network) |
+/// | Notification scheduling | Backend notification scheduler (server clock) |
+///
+/// Client clocks are never authoritative; skew between a client and the
+/// server must not extend or shorten any of the deadlines above.
+pub trait Clock: Send + Sync {
+    /// Current wall-clock time as observed by the component under test.
+    fn now(&self) -> SystemTime;
+}
+
+/// Production clock backed by [`SystemTime::now`].
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// Manually advanced clock for deterministic skew scenarios.
+///
+/// The clock can be moved forwards or backwards to simulate client/server
+/// skew in both directions as well as a suspended tab resuming with a stale
+/// notion of "now".
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct MockClock {
+    now: Arc<Mutex<SystemTime>>,
+}
+
+#[allow(dead_code)]
+impl MockClock {
+    /// Create a clock pinned to the given instant.
+    pub fn at(now: SystemTime) -> Self {
+        Self {
+            now: Arc::new(Mutex::new(now)),
+        }
+    }
+
+    /// Create a clock pinned to `UNIX_EPOCH + offset`.
+    pub fn from_unix(offset: Duration) -> Self {
+        Self::at(UNIX_EPOCH + offset)
+    }
+
+    /// Advance the clock forwards by `delta`.
+    pub fn advance(&self, delta: Duration) {
+        let mut guard = self.now.lock().expect("mock clock poisoned");
+        *guard += delta;
+    }
+
+    /// Move the clock backwards by `delta`, simulating a client that is ahead
+    /// of the server (or a tab resuming with a stale timestamp).
+    pub fn rewind(&self, delta: Duration) {
+        let mut guard = self.now.lock().expect("mock clock poisoned");
+        *guard = guard.checked_sub(delta).unwrap_or(UNIX_EPOCH);
+    }
+
+    /// Pin the clock to an absolute instant.
+    pub fn set(&self, now: SystemTime) {
+        let mut guard = self.now.lock().expect("mock clock poisoned");
+        *guard = now;
+    }
+}
+
+impl Clock for MockClock {
+    fn now(&self) -> SystemTime {
+        *self.now.lock().expect("mock clock poisoned")
+    }
+}
+
+/// Convenience alias for a shared, type-erased clock handle.
+#[allow(dead_code)]
+pub type SharedClock = Arc<dyn Clock>;
+
+/// Build a [`SharedClock`] from any [`Clock`] implementation.
+#[allow(dead_code)]
+pub fn shared_clock<C: Clock + 'static>(clock: C) -> SharedClock {
+    Arc::new(clock)
+}
 
 /// Start a temporary Postgres container and return a SQLx pool bound to it.
 ///
@@ -101,14 +201,14 @@ pub const DEPENDENCY_RECOVERY_BOUND: Duration = Duration::from_secs(10);
 /// Services must continue to make progress (or fail fast and retry) while a
 /// dependency is slower than this threshold.
 #[allow(dead_code)]
-pub const MAX_INJECTED_LATENCY: Duration = Duration::from_millisec(500);
+pub const MAX_INJECTED_LATENCY: Duration = Duration::from_millis(500);
 
 /// Minimum duration a fault is held in place before recovery is exercised.
 ///
 /// Keeping the fault active long enough ensures the system actually observes
 /// degraded behavior rather than racing past a transient blip.
 #[allow(dead_code)]
-pub const MIN_FAULT_DURATION: Duration = Duration::from_milliseconds(500);
+pub const MIN_FAULT_DURATION: Duration = Duration::from_millis(500);
 
 /// Represents the kind of fault injected into a dependency during a chaos test.
 #[allow(dead_code)]
@@ -144,7 +244,7 @@ pub struct RecoveryMetrics {
 impl RecoveryMetrics {
     /// Returns true when no events were lost and no duplicate transactions
     /// occurred, and recovery completed within the documented bound.
-    [#allow(dead_code)]
+    #[allow(dead_code)]
     pub fn is_healthy(&self) -> bool {
         self.events_ingested == self.events_persisted
             && self.duplicate_transactions == 0

@@ -1,0 +1,114 @@
+{
+  "$schema": "./schema.json",
+  "meta": {
+    "locale": "en",
+    "name": "English",
+    "direction": "ltr",
+    "version": "1.0.0",
+    "policy": "./LOCALE_POLICY.md"
+  },
+  "common": {
+    "appName": "Marketplace",
+    "loading": "Loading…",
+    "retry": "Retry",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "close": "Close",
+    "error": {
+      "generic": "Something went wrong. Please try again.",
+      "network": "Network error. Check your connection and try again.",
+      "notFound": "The requested item could not be found."
+    }
+  },
+  "market": {
+    "title": "Markets",
+    "empty": "No markets available.",
+    "lifecycle": {
+      "draft": "Draft",
+      "open": "Open",
+      "closed": "Closed",
+      "settled": "Settled",
+      "cancelled": "Cancelled",
+      "disputed": "Disputed"
+    },
+    "status": {
+      "active": "Active",
+      "paused": "Paused",
+      "resolved": "Resolved"
+    },
+    "outcome": {
+      "yes": "Yes",
+      "no": "No",
+      "undetermined": "Undetermined"
+    },
+    "count": {
+      "one": "{count} market",
+      "other": "{count} markets"
+    },
+    "closesIn": {
+      "one": "Closes in {count} day",
+      "other": "Closes in {count} days"
+    }
+  },
+  "transaction": {
+    "title": "Transactions",
+    "empty": "No transactions yet.",
+    "lifecycle": {
+      "pending": "Pending",
+      "confirmed": "Confirmed",
+      "failed": "Failed",
+      "reverted": "Reverted",
+      "expired": "Expired"
+    },
+    "type": {
+      "buy": "Buy",
+      "sell": "Sell",
+      "transfer": "Transfer",
+      "claim": "Claim"
+    },
+    "amount": {
+      "one": "{count} transaction",
+      "other": "{count} transactions"
+    },
+    "confirmations": {
+      "one": "{count} confirmation",
+      "other": "{count} confirmations"
+    },
+    "summary": "You {type} {amount} on {market}",
+    "fee": "Fee: {amount}",
+    "total": "Total: {amount}"
+  },
+  "validation": {
+    "required": "This field is required.",
+    "invalidAmount": "Enter a valid amount.",
+    "invalidAddress": "Enter a valid address.",
+    "minLength": {
+      "one": "Must be at least {count} character.",
+      "other": "Must be at least {count} characters."
+    },
+    "maxLength": {
+      "one": "Must be at most {count} character.",
+      "other": "Must be at most {count} characters."
+    }
+  },
+  "time": {
+    "relative": {
+      "secondsAgo": {
+        "one": "{count} second ago",
+        "other": "{count} seconds ago"
+      },
+      "minutesAgo": {
+        "one": "{count} minute ago",
+        "other": "{count} minutes ago"
+      },
+      "hoursAgo": {
+        "one": "{count} hour ago",
+        "other": "{count} hours ago"
+      },
+      "daysAgo": {
+        "one": "{count} day ago",
+        "other": "{count} days ago"
+      }
+    }
+  }
+}

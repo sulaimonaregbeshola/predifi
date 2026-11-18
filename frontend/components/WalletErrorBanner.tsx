@@ -1,9 +1,10 @@
 "use client";
 
-import { AlertTriangle, Wallet, XCircle, Clock, Coins, RefreshCw, X } from "lucide-react";
+import { AlertTriangle, Wallet, XCircle, Clock, Coins, RefreshCw, X, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import type { WalletError, WalletErrorCode } from "@/lib/walletErrors";
+import type { ContractIdentityDiagnostic } from "@/lib/contractIdentity";
 
 const ICONS: Record<WalletErrorCode, typeof AlertTriangle> = {
   NETWORK_MISMATCH: AlertTriangle,
@@ -13,6 +14,12 @@ const ICONS: Record<WalletErrorCode, typeof AlertTriangle> = {
   INSUFFICIENT_BALANCE: Coins,
   STALE_SEQUENCE: RefreshCw,
   UNKNOWN: AlertTriangle,
+};
+
+const IDENTITY_HEADINGS: Record<ContractIdentityDiagnostic["kind"], string> = {
+  MISMATCH: "Contract identity mismatch",
+  UNAVAILABLE: "Contract identity unavailable",
+  STALE_MANIFEST: "Deployment manifest is stale",
 };
 
 interface WalletErrorBannerProps {
@@ -27,6 +34,15 @@ interface WalletErrorBannerProps {
   onRecheckNetwork?: () => void;
   /** True while a network re-check is in flight. */
   isRechecking?: boolean;
+  /**
+   * Contract-identity guard diagnostic. When present, mutations are disabled
+   * and the diagnostic is surfaced so the user never acts on unverified state.
+   */
+  identityDiagnostic?: ContractIdentityDiagnostic | null;
+  /** Re-runs the contract-identity check against the pinned manifest. */
+  onRecheckIdentity?: () => void;
+  /** True while a contract-identity re-check is in flight. */
+  isRecheckingIdentity?: boolean;
   className?: string;
 }
 
@@ -44,8 +60,12 @@ export function WalletErrorBanner({
   contractEnvironment,
   onRecheckNetwork,
   isRechecking = false,
+  identityDiagnostic,
+  onRecheckIdentity,
+  isRecheckingIdentity = false,
   className,
 }: WalletErrorBannerProps) {
+  const hasIdentityIssue = Boolean(identityDiagnostic);
   // A deliberate cancellation is not an error — render neutral copy only.
   if (error.code === "USER_REJECTED") {
     return (
@@ -75,9 +95,10 @@ export function WalletErrorBanner({
 
   const Icon = ICONS[error.code];
   const isNetworkMismatch = error.code === "NETWORK_MISMATCH";
-  // While the wallet is on the wrong network, retrying would submit against an
-  // unintended contract deployment, so only the re-check action is offered.
-  const showRetry = Boolean(onRetry) && !isNetworkMismatch;
+  // While the wallet is on the wrong network or the contract identity is
+  // unverified, retrying would submit against an unintended deployment, so
+  // only the re-check actions are offered.
+  const showRetry = Boolean(onRetry) && !isNetworkMismatch && !hasIdentityIssue;
 
   return (
     <div
@@ -114,6 +135,58 @@ export function WalletErrorBanner({
               )}
             </dl>
           )}
+          {identityDiagnostic && (
+            <div
+              className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm"
+              data-testid="contract-identity-diagnostic"
+              data-identity-kind={identityDiagnostic.kind}
+            >
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="h-4 w-4 shrink-0 text-amber-400" aria-hidden />
+                <p className="font-semibold text-amber-200">
+                  {IDENTITY_HEADINGS[identityDiagnostic.kind]}
+                </p>
+              </div>
+              <p className="mt-1 text-zinc-300">{identityDiagnostic.message}</p>
+              <p className="mt-1 text-zinc-400">
+                Mutations are disabled until the contract identity is verified.
+              </p>
+              <dl className="mt-2 space-y-1 text-zinc-400">
+                {identityDiagnostic.expectedContractId && (
+                  <div className="flex justify-between gap-3">
+                    <dt>Expected contract</dt>
+                    <dd className="truncate font-mono text-zinc-200">
+                      {identityDiagnostic.expectedContractId}
+                    </dd>
+                  </div>
+                )}
+                {identityDiagnostic.actualContractId && (
+                  <div className="flex justify-between gap-3">
+                    <dt>Configured contract</dt>
+                    <dd className="truncate font-mono text-zinc-200">
+                      {identityDiagnostic.actualContractId}
+                    </dd>
+                  </div>
+                )}
+                {identityDiagnostic.expectedNetwork && (
+                  <div className="flex justify-between gap-3">
+                    <dt>Expected network</dt>
+                    <dd className="font-medium text-zinc-200">
+                      {identityDiagnostic.expectedNetwork}
+                    </dd>
+                  </div>
+                )}
+                {identityDiagnostic.actualNetwork && (
+                  <div className="flex justify-between gap-3">
+                    <dt>Configured network</dt>
+                    <dd className="font-medium text-zinc-200">
+                      {identityDiagnostic.actualNetwork}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+          )}
           <div className="mt-3 flex flex-wrap gap-2">
             {isNetworkMismatch && onRecheckNetwork && (
               <Button
@@ -125,6 +198,18 @@ export function WalletErrorBanner({
                 data-testid="recheck-network-button"
               >
                 {isRechecking ? "Re-checking…" : "Re-check network"}
+              </Button>
+            )}
+            {hasIdentityIssue && onRecheckIdentity && (
+              <Button
+                type="button"
+                size="small"
+                onClick={onRecheckIdentity}
+                disabled={isRecheckingIdentity}
+                aria-busy={isRecheckingIdentity}
+                data-testid="recheck-identity-button"
+              >
+                {isRecheckingIdentity ? "Re-checking…" : "Re-check contract"}
               </Button>
             )}
             {showRetry && (

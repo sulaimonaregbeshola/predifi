@@ -30,6 +30,322 @@ const DEFAULT_SECRET_KEY: &str = "predifi-dev-secret-do-not-use-in-production-32
 const DEFAULT_APP_ENV: &str = "development";
 const DEFAULT_INDEXER_MAX_BATCH_SIZE: usize = crate::constants::DEFAULT_INDEXER_MAX_BATCH_SIZE;
 
+// ── Contract identity pinning (issue #347) ───────────────────────────────────
+/// Environment variable holding the path to the pinned deployment manifest.
+const MANIFEST_PATH_ENV: &str = "PREDIFI_CONTRACT_MANIFEST_PATH";
+/// Environment variable holding the contract ID the backend is configured for.
+const CONTRACT_ID_ENV: &str = "PREDIFI_CONTRACT_ID";
+/// Environment variable holding the network passphrase the backend expects.
+const NETWORK_PASSPHRASE_ENV: &str = "PREDIFI_NETWORK_PASSPHRASE";
+/// Environment variable holding the contract interface version the backend
+/// was built against.
+const CONTRACT_INTERFACE_VERSION_ENV: &str = "PREDIFI_CONTRACT_INTERFACE_VERSION";
+/// Interface version this build of the backend supports.
+pub const SUPPORTED_CONTRACT_INTERFACE_VERSION: u32 = 1;
+/// Default network passphrase used when none is configured (Stellar testnet).
+const DEFAULT_NETWORK_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+/// Default contract interface version used when none is configured.
+const DEFAULT_CONTRACT_INTERFACE_VERSION: u32 = SUPPORTED_CONTRACT_INTERFACE_VERSION;
+/// Default path to the pinned deployment manifest.
+const DEFAULT_MANIFEST_PATH: &str = "deployments/contract-manifest.json";
+/// Maximum age, in seconds, a manifest may have before it is considered stale.
+const DEFAULT_MANIFEST_MAX_AGE_SECS: u64 = 86_400;
+/// Environment variable overriding the maximum manifest age.
+const MANIFEST_MAX_AGE_ENV: &str = "PREDIFI_CONTRACT_MANIFEST_MAX_AGE_SECS";
+
+/// A pinned deployment manifest describing the contract this backend is
+/// allowed to talk to.
+///
+/// The manifest is the source of truth for contract identity: the configured
+/// contract ID, network passphrase and interface version must all match it
+/// before any mutation is permitted. There is deliberately no fallback to an
+/// unverified contract — a missing, stale or mismatched manifest disables
+/// mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentManifest {
+    /// The contract ID (Stellar contract address) pinned by the deployment.
+    pub contract_id: String,
+    /// The network passphrase the contract is deployed on.
+    pub network_passphrase: String,
+    /// The contract interface version the manifest was produced for.
+    pub interface_version: u32,
+    /// Unix timestamp (seconds) at which the manifest was generated.
+    pub generated_at: u64,
+}
+
+impl DeploymentManifest {
+    /// Parse a manifest from its JSON representation.
+    ///
+    /// The parser is intentionally minimal (no external dependency) and
+    /// accepts a flat JSON object with the keys `contract_id`,
+    /// `network_passphrase`, `interface_version` and `generated_at`.
+    pub fn from_json(raw: &str) -> Result<Self, ManifestError> {
+        let contract_id = json_string_field(raw, "contract_id")
+            .ok_or_else(|| ManifestError::Malformed(String::from("missing 'contract_id'")))?;
+        let network_passphrase = json_string_field(raw, "network_passphrase").ok_or_else(|| {
+            ManifestError::Malformed(String::from("missing 'network_passphrase'"))
+        })?;
+        let interface_version = json_u64_field(raw, "interface_version").ok_or_else(|| {
+            ManifestError::Malformed(String::from("missing 'interface_version'"))
+        })?;
+        let generated_at = json_u64_field(raw, "generated_at")
+            .ok_or_else(|| ManifestError::Malformed(String::from("missing 'generated_at'")))?;
+
+        if contract_id.trim().is_empty() {
+            return Err(ManifestError::Malformed(String::from(
+                "'contract_id' must not be empty",
+            )));
+        }
+        if network_passphrase.trim().is_empty() {
+            return Err(ManifestError::Malformed(String::from(
+                "'network_passphrase' must not be empty",
+            )));
+        }
+        let interface_version = u32::try_from(interface_version).map_err(|_| {
+            ManifestError::Malformed(String::from("'interface_version' out of range"))
+        })?;
+
+        Ok(Self {
+            contract_id,
+            network_passphrase,
+            interface_version,
+            generated_at,
+        })
+    }
+}
+
+/// Errors produced while loading or parsing a deployment manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestError {
+    /// The manifest file could not be read.
+    Unavailable(String),
+    /// The manifest contents could not be parsed.
+    Malformed(String),
+}
+
+impl fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(reason) => write!(f, "manifest unavailable: {reason}"),
+            Self::Malformed(reason) => write!(f, "manifest malformed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ManifestError {}
+
+/// Outcome of verifying the configured contract identity against the pinned
+/// deployment manifest.
+///
+/// The server/router uses this to gate mutation routes: only
+/// [`ContractIdentityStatus::Verified`] permits mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractIdentityStatus {
+    /// The configured identity matches the pinned manifest and the manifest is
+    /// fresh and supported.
+    Verified {
+        /// The verified contract ID.
+        contract_id: String,
+        /// The verified network passphrase.
+        network_passphrase: String,
+        /// The verified interface version.
+        interface_version: u32,
+    },
+    /// The configured identity does not match the pinned manifest.
+    Mismatch {
+        /// Human-readable description of the mismatch.
+        reason: String,
+    },
+    /// The manifest could not be loaded.
+    Unavailable {
+        /// Human-readable description of why the manifest is unavailable.
+        reason: String,
+    },
+    /// The manifest is stale (older than the configured maximum age).
+    Stale {
+        /// Human-readable description of why the manifest is stale.
+        reason: String,
+    },
+}
+
+impl ContractIdentityStatus {
+    /// `true` only when the contract identity has been verified.
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified { .. })
+    }
+
+    /// `true` when mutations must be disabled.
+    pub fn mutations_disabled(&self) -> bool {
+        !self.is_verified()
+    }
+
+    /// A stable machine-readable code for diagnostics.
+    pub fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Verified { .. } => "contract_identity_verified",
+            Self::Mismatch { .. } => "contract_identity_mismatch",
+            Self::Unavailable { .. } => "contract_identity_unavailable",
+            Self::Stale { .. } => "contract_identity_stale",
+        }
+    }
+
+    /// A human-readable diagnostic message.
+    pub fn diagnostic_message(&self) -> String {
+        match self {
+            Self::Verified {
+                contract_id,
+                network_passphrase,
+                interface_version,
+            } => format!(
+                "contract identity verified: id={contract_id} network={network_passphrase} interface_version={interface_version}"
+            ),
+            Self::Mismatch { reason } => {
+                format!("contract identity mismatch: {reason}; mutations disabled")
+            }
+            Self::Unavailable { reason } => {
+                format!("contract identity unavailable: {reason}; mutations disabled")
+            }
+            Self::Stale { reason } => {
+                format!("contract identity stale: {reason}; mutations disabled")
+            }
+        }
+    }
+}
+
+/// The configured contract identity, as read from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractIdentityConfig {
+    /// Path to the pinned deployment manifest.
+    pub manifest_path: String,
+    /// Contract ID the backend is configured to talk to.
+    pub contract_id: String,
+    /// Network passphrase the backend expects.
+    pub network_passphrase: String,
+    /// Contract interface version the backend was built against.
+    pub interface_version: u32,
+    /// Maximum age (seconds) a manifest may have before it is stale.
+    pub manifest_max_age_secs: u64,
+}
+
+impl ContractIdentityConfig {
+    /// Verify this identity against the pinned manifest.
+    ///
+    /// `now_unix_secs` is the current Unix time in seconds; it is passed in so
+    /// callers (and tests) control staleness evaluation.
+    pub fn verify(&self, now_unix_secs: u64) -> ContractIdentityStatus {
+        let raw = match std::fs::read_to_string(&self.manifest_path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                return ContractIdentityStatus::Unavailable {
+                    reason: format!("could not read '{}': {err}", self.manifest_path),
+                };
+            }
+        };
+
+        let manifest = match DeploymentManifest::from_json(&raw) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                return ContractIdentityStatus::Unavailable {
+                    reason: format!("'{}': {err}", self.manifest_path),
+                };
+            }
+        };
+
+        // Staleness is checked before identity so a stale manifest never
+        // silently authorises a matching-but-outdated contract.
+        if self.manifest_max_age_secs > 0 {
+            let age = now_unix_secs.saturating_sub(manifest.generated_at);
+            if age > self.manifest_max_age_secs {
+                return ContractIdentityStatus::Stale {
+                    reason: format!(
+                        "manifest generated_at={} is {}s old (max {}s)",
+                        manifest.generated_at, age, self.manifest_max_age_secs
+                    ),
+                };
+            }
+        }
+
+        if manifest.contract_id != self.contract_id {
+            return ContractIdentityStatus::Mismatch {
+                reason: format!(
+                    "configured contract_id '{}' does not match pinned '{}'",
+                    self.contract_id, manifest.contract_id
+                ),
+            };
+        }
+        if manifest.network_passphrase != self.network_passphrase {
+            return ContractIdentityStatus::Mismatch {
+                reason: format!(
+                    "configured network_passphrase '{}' does not match pinned '{}'",
+                    self.network_passphrase, manifest.network_passphrase
+                ),
+            };
+        }
+        if manifest.interface_version != self.interface_version {
+            return ContractIdentityStatus::Mismatch {
+                reason: format!(
+                    "configured interface_version {} does not match pinned {}",
+                    self.interface_version, manifest.interface_version
+                ),
+            };
+        }
+        if manifest.interface_version != SUPPORTED_CONTRACT_INTERFACE_VERSION {
+            return ContractIdentityStatus::Mismatch {
+                reason: format!(
+                    "pinned interface_version {} is not supported by this build (supports {})",
+                    manifest.interface_version, SUPPORTED_CONTRACT_INTERFACE_VERSION
+                ),
+            };
+        }
+
+        ContractIdentityStatus::Verified {
+            contract_id: manifest.contract_id,
+            network_passphrase: manifest.network_passphrase,
+            interface_version: manifest.interface_version,
+        }
+    }
+}
+
+/// Extract a JSON string field from a flat JSON object.
+fn json_string_field(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = raw.find(&needle)? + needle.len();
+    let rest = raw[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// Extract a JSON unsigned-integer field from a flat JSON object.
+fn json_u64_field(raw: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let start = raw.find(&needle)? + needle.len();
+    let rest = raw[start..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
 // ── Database connection budget (issue #353) ──────────────────────────────────
 /// Default PostgreSQL server-side connection limit (`max_connections`).
 const DEFAULT_DB_SERVER_MAX_CONNECTIONS: u32 = 100;
@@ -273,6 +589,23 @@ pub struct Config {
     /// `quorum`, `first`, `strict`. Read from `PREDIFI_RPC_DISAGREEMENT_POLICY`.
     pub rpc_disagreement_policy: String,
 
+    // ── Contract identity pinning (issue #347) ───────────────────────────────
+    /// Path to the pinned deployment manifest. Read from
+    /// `PREDIFI_CONTRACT_MANIFEST_PATH`.
+    pub contract_manifest_path: String,
+    /// Contract ID the backend is configured to talk to. Read from
+    /// `PREDIFI_CONTRACT_ID`.
+    pub contract_id: String,
+    /// Network passphrase the backend expects. Read from
+    /// `PREDIFI_NETWORK_PASSPHRASE`.
+    pub network_passphrase: String,
+    /// Contract interface version the backend was built against. Read from
+    /// `PREDIFI_CONTRACT_INTERFACE_VERSION`.
+    pub contract_interface_version: u32,
+    /// Maximum age (seconds) a manifest may have before it is considered
+    /// stale. Read from `PREDIFI_CONTRACT_MANIFEST_MAX_AGE_SECS`.
+    pub contract_manifest_max_age_secs: u64,
+
     // ── Database connection budget (issue #353) ──────────────────────────────
     /// PostgreSQL server-side connection limit (`max_connections`). Default
     /// `100`. Read from `PREDIFI_DB_SERVER_MAX_CONNECTIONS`.
@@ -494,6 +827,26 @@ impl Config {
             DEFAULT_RPC_DISAGREEMENT_POLICY,
         );
 
+        // ── Contract identity pinning (issue #347) ───────────────────────────
+        let contract_manifest_path =
+            get_string(vars, MANIFEST_PATH_ENV, DEFAULT_MANIFEST_PATH);
+        let contract_id = get_string(vars, CONTRACT_ID_ENV, "");
+        let network_passphrase = get_string(
+            vars,
+            NETWORK_PASSPHRASE_ENV,
+            DEFAULT_NETWORK_PASSPHRASE,
+        );
+        let contract_interface_version = get_u32(
+            vars,
+            CONTRACT_INTERFACE_VERSION_ENV,
+            DEFAULT_CONTRACT_INTERFACE_VERSION,
+        )?;
+        let contract_manifest_max_age_secs = get_u64(
+            vars,
+            MANIFEST_MAX_AGE_ENV,
+            DEFAULT_MANIFEST_MAX_AGE_SECS,
+        )?;
+
         // ── Database connection budget (issue #353) ──────────────────────────
         let db_server_max_connections = get_u32(
             vars,
@@ -597,6 +950,11 @@ impl Config {
             rpc_provider_unhealthy_threshold,
             rpc_provider_healthy_threshold,
             rpc_disagreement_policy,
+            contract_manifest_path,
+            contract_id,
+            network_passphrase,
+            contract_interface_version,
+            contract_manifest_max_age_secs,
             notification_provider_url,
             notification_provider_key,
             notification_provider_previous_key,
@@ -611,6 +969,26 @@ impl Config {
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// Build the contract identity configuration from this config.
+    pub fn contract_identity(&self) -> ContractIdentityConfig {
+        ContractIdentityConfig {
+            manifest_path: self.contract_manifest_path.clone(),
+            contract_id: self.contract_id.clone(),
+            network_passphrase: self.network_passphrase.clone(),
+            interface_version: self.contract_interface_version,
+            manifest_max_age_secs: self.contract_manifest_max_age_secs,
+        }
+    }
+
+    /// Verify the configured contract identity against the pinned manifest.
+    ///
+    /// Called at startup and on network change. The result gates mutation
+    /// routes: anything other than [`ContractIdentityStatus::Verified`]
+    /// disables mutations. There is no fallback to an unverified contract.
+    pub fn verify_contract_identity(&self, now_unix_secs: u64) -> ContractIdentityStatus {
+        self.contract_identity().verify(now_unix_secs)
     }
 
     /// Validate semantic constraints on a fully-built configuration.
@@ -937,6 +1315,32 @@ impl Config {
             });
         }
 
+        // ── Contract identity pinning (issue #347) ───────────────────────────
+        if self.contract_manifest_path.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: MANIFEST_PATH_ENV,
+                reason: String::from("must not be empty"),
+            });
+        }
+        if self.contract_interface_version != SUPPORTED_CONTRACT_INTERFACE_VERSION {
+            return Err(ConfigError::InvalidValue {
+                key: CONTRACT_INTERFACE_VERSION_ENV,
+                reason: format!(
+                    "this build only supports interface version {}; got {}",
+                    SUPPORTED_CONTRACT_INTERFACE_VERSION, self.contract_interface_version
+                ),
+            });
+        }
+        // In production the contract ID must be pinned explicitly: an empty ID
+        // can never match a manifest and would silently disable mutations.
+        if self.is_production() && self.contract_id.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                key: CONTRACT_ID_ENV,
+                reason: String::from(
+                    "must be set in production so the contract identity can be verified",
+                ),
+            });
+        }
         // ── Database connection budget (issue #353) ──────────────────────────
         if self.db_server_max_connections == 0 {
             return Err(ConfigError::InvalidValue {
@@ -975,6 +1379,9 @@ impl Config {
                 ),
             });
         }
+                ),
+            });
+        }
 
         // ── Notification provider credentials (issue #355) ───────────────────
         let provider_url = self.notification_provider_url.trim();
@@ -1007,9 +1414,23 @@ impl Config {
             return Err(ConfigError::InvalidValue {
                 key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
                 reason: String::from(
-                    "a previ
+                    "a previous credential requires PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED=true; \
+                     dual-key transition must be explicitly allowed",
                 ),
             });
+        }
+
+        // The previous key must differ from the current key — otherwise the
+        // rotation has not actually happened.
+        if let Some(previous) = &self.notification_provider_previous_key {
+            if previous.trim() == self.notification_provider_key.trim() {
+                return Err(ConfigError::InvalidValue {
+                    key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
+                    reason: String::from(
+                        "must differ from PREDIFI_NOTIFICATION_PROVIDER_KEY during a rotation",
+                    ),
+                });
+            }
         }
 
         let budget = self.db_connection_budget();
@@ -1032,35 +1453,6 @@ impl Config {
                     self.db_server_max_connections
                 ),
             });
-        }
-
-        // Dual-key transition is opt-in only. A previous key without explicit
-        // opt-in is a misconfiguration (the provider may not support it).
-        if self.notification_provider_previous_key.is_some() && !self.notification_dual_key_enabled {
-            return Err(ConfigError::InvalidValue {
-                key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
-                reason: String::from(
-                    "a previous credential requires PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED=true; \
-                     dual-key transition must be explicitly allowed",
-                ),
-            });
-        }
-
-                ),
-            });
-        }
-
-        // The previous key must differ from the current key — otherwise the
-        // rotation has not actually happened.
-        if let Some(previous) = &self.notification_provider_previous_key {
-            if previous.trim() == self.notification_provider_key.trim() {
-                return Err(ConfigError::InvalidValue {
-                    key: "PREDIFI_NOTIFICATION_PROVIDER_PREVIOUS_KEY",
-                    reason: String::from(
-                        "must differ from PREDIFI_NOTIFICATION_PROVIDER_KEY during a rotation",
-                    ),
-                });
-            }
         }
 
         Ok(())
@@ -1158,6 +1550,11 @@ impl Config {
             rpc_provider_unhealthy_threshold: DEFAULT_RPC_PROVIDER_UNHEALTHY_THRESHOLD,
             rpc_provider_healthy_threshold: DEFAULT_RPC_PROVIDER_HEALTHY_THRESHOLD,
             rpc_disagreement_policy: String::from(DEFAULT_RPC_DISAGREEMENT_POLICY),
+            contract_manifest_path: String::from(DEFAULT_MANIFEST_PATH),
+            contract_id: String::new(),
+            network_passphrase: String::from(DEFAULT_NETWORK_PASSPHRASE),
+            contract_interface_version: DEFAULT_CONTRACT_INTERFACE_VERSION,
+            contract_manifest_max_age_secs: DEFAULT_MANIFEST_MAX_AGE_SECS,
             notification_provider_url: String::from(DEFAULT_NOTIFICATION_PROVIDER_URL),
             notification_provider_key: String::new(),
             notification_provider_previous_key: None,
@@ -3134,161 +3531,209 @@ mod tests {
         ));
     }
 
-    // ── Database connection budget (issue #353) ──────────────────────────────
+    // ── Contract identity pinning (issue #347) ───────────────────────────────
 
-    #[test]
-    fn db_budget_uses_defaults_when_env_absent() {
-        let vars = HashMap::new();
-        let config = Config::from_map(&vars).unwrap();
-        assert_eq!(
-            config.db_server_max_connections,
-            DEFAULT_DB_SERVER_MAX_CONNECTIONS
-        );
-        assert_eq!(
-            config.db_admin_headroom_connections,
-            DEFAULT_DB_ADMIN_HEADROOM_CONNECTIONS
-        );
-        assert_eq!(config.db_max_replicas, DEFAULT_DB_MAX_REPLICAS);
-        assert_eq!(
-            config.db_pool_size_per_replica,
-            DEFAULT_DB_POOL_SIZE_PER_REPLICA
-        );
-        assert_eq!(config.db_auxiliary_services, DEFAULT_DB_AUXILIARY_SERVICES);
-        assert_eq!(config.db_auxiliary_pool_size, DEFAULT_DB_AUXILIARY_POOL_SIZE);
+    fn write_manifest(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write manifest");
+        path
+    }
+
+    fn manifest_json(
+        contract_id: &str,
+        network_passphrase: &str,
+        interface_version: u32,
+        generated_at: u64,
+    ) -> String {
+        format!(
+            "{{\n  \"contract_id\": \"{contract_id}\",\n  \"network_passphrase\": \"{network_passphrase}\",\n  \"interface_version\": {interface_version},\n  \"generated_at\": {generated_at}\n}}\n"
+        )
+    }
+
+    fn identity_config(path: &std::path::Path, contract_id: &str) -> ContractIdentityConfig {
+        ContractIdentityConfig {
+            manifest_path: path.to_string_lossy().into_owned(),
+            contract_id: String::from(contract_id),
+            network_passphrase: String::from(DEFAULT_NETWORK_PASSPHRASE),
+            interface_version: SUPPORTED_CONTRACT_INTERFACE_VERSION,
+            manifest_max_age_secs: DEFAULT_MANIFEST_MAX_AGE_SECS,
+        }
     }
 
     #[test]
-    fn db_budget_reads_from_env() {
+    fn contract_identity_verified_when_manifest_matches() {
+        let dir = std::env::temp_dir().join(format!("predifi-manifest-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_manifest(
+            &dir,
+            "ok.json",
+            &manifest_json("CABC", DEFAULT_NETWORK_PASSPHRASE, 1, 1_000),
+        );
+        let status = identity_config(&path, "CABC").verify(1_100);
+        assert!(status.is_verified(), "expected verified, got {status:?}");
+        assert!(!status.mutations_disabled());
+        assert_eq!(status.diagnostic_code(), "contract_identity_verified");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_identity_mismatch_disables_mutations() {
+        let dir =
+            std::env::temp_dir().join(format!("predifi-manifest-mm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_manifest(
+            &dir,
+            "mm.json",
+            &manifest_json("COTHER", DEFAULT_NETWORK_PASSPHRASE, 1, 1_000),
+        );
+        let status = identity_config(&path, "CABC").verify(1_100);
+        assert!(matches!(status, ContractIdentityStatus::Mismatch { .. }));
+        assert!(status.mutations_disabled());
+        assert_eq!(status.diagnostic_code(), "contract_identity_mismatch");
+        assert!(status.diagnostic_message().contains("mutations disabled"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_identity_mismatch_on_network_passphrase() {
+        let dir =
+            std::env::temp_dir().join(format!("predifi-manifest-net-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_manifest(
+            &dir,
+            "net.json",
+            &manifest_json("CABC", "Public Global Stellar Network ; September 2015", 1, 1_000),
+        );
+        let status = identity_config(&path, "CABC").verify(1_100);
+        assert!(matches!(status, ContractIdentityStatus::Mismatch { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_identity_mismatch_on_unsupported_interface() {
+        let dir =
+            std::env::temp_dir().join(format!("predifi-manifest-if-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_manifest(
+            &dir,
+            "if.json",
+            &manifest_json("CABC", DEFAULT_NETWORK_PASSPHRASE, 99, 1_000),
+        );
+        let status = identity_config(&path, "CABC").verify(1_100);
+        assert!(matches!(status, ContractIdentityStatus::Mismatch { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_identity_unavailable_when_manifest_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "predifi-manifest-missing-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let status = identity_config(&path, "CABC").verify(1_100);
+        assert!(matches!(status, ContractIdentityStatus::Unavailable { .. }));
+        assert!(status.mutations_disabled());
+        assert_eq!(status.diagnostic_code(), "contract_identity_unavailable");
+    }
+
+    #[test]
+    fn contract_identity_unavailable_when_manifest_malformed() {
+        let dir =
+            std::env::temp_dir().join(format!("predifi-manifest-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_manifest(&dir, "bad.json", "{ not json");
+        let status = identity_config(&path, "CABC").verify(1_100);
+        assert!(matches!(status, ContractIdentityStatus::Unavailable { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_identity_stale_manifest_disables_mutations() {
+        let dir =
+            std::env::temp_dir().join(format!("predifi-manifest-st-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_manifest(
+            &dir,
+            "st.json",
+            &manifest_json("CABC", DEFAULT_NETWORK_PASSPHRASE, 1, 1_000),
+        );
+        let mut cfg = identity_config(&path, "CABC");
+        cfg.manifest_max_age_secs = 60;
+        let status = cfg.verify(10_000);
+        assert!(matches!(status, ContractIdentityStatus::Stale { .. }));
+        assert!(status.mutations_disabled());
+        assert_eq!(status.diagnostic_code(), "contract_identity_stale");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_identity_never_falls_back_to_unverified_contract() {
+        // A missing manifest must never produce a Verified status even when the
+        // configured contract ID is non-empty.
+        let path = std::env::temp_dir().join(format!(
+            "predifi-manifest-nofallback-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let status = identity_config(&path, "CABC").verify(0);
+        assert!(!status.is_verified());
+        assert!(status.mutations_disabled());
+    }
+
+    #[test]
+    fn config_reads_contract_identity_from_env() {
         let vars = HashMap::from([
             (
-                String::from("PREDIFI_DB_SERVER_MAX_CONNECTIONS"),
-                String::from("200"),
+                String::from(MANIFEST_PATH_ENV),
+                String::from("/etc/predifi/manifest.json"),
+            ),
+            (String::from(CONTRACT_ID_ENV), String::from("CABC")),
+            (
+                String::from(NETWORK_PASSPHRASE_ENV),
+                String::from("Test SDF Network ; September 2015"),
             ),
             (
-                String::from("PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS"),
-                String::from("20"),
-            ),
-            (String::from("PREDIFI_DB_MAX_REPLICAS"), String::from("4")),
-            (
-                String::from("PREDIFI_DB_POOL_SIZE_PER_REPLICA"),
-                String::from("15"),
+                String::from(CONTRACT_INTERFACE_VERSION_ENV),
+                String::from("1"),
             ),
             (
-                String::from("PREDIFI_DB_AUXILIARY_SERVICES"),
-                String::from("2"),
-            ),
-            (
-                String::from("PREDIFI_DB_AUXILIARY_POOL_SIZE"),
-                String::from("5"),
+                String::from(MANIFEST_MAX_AGE_ENV),
+                String::from("3600"),
             ),
         ]);
         let config = Config::from_map(&vars).unwrap();
-        assert_eq!(config.db_server_max_connections, 200);
-        assert_eq!(config.db_admin_headroom_connections, 20);
-        assert_eq!(config.db_max_replicas, 4);
-        assert_eq!(config.db_pool_size_per_replica, 15);
-        assert_eq!(config.db_auxiliary_services, 2);
-        assert_eq!(config.db_auxiliary_pool_size, 5);
+        assert_eq!(config.contract_manifest_path, "/etc/predifi/manifest.json");
+        assert_eq!(config.contract_id, "CABC");
+        assert_eq!(config.contract_interface_version, 1);
+        assert_eq!(config.contract_manifest_max_age_secs, 3600);
     }
 
     #[test]
-    fn db_budget_computes_required_and_available() {
-        let config = Config {
-            db_server_max_connections: 100,
-            db_admin_headroom_connections: 10,
-            db_max_replicas: 4,
-            db_pool_size_per_replica: 10,
-            db_auxiliary_services: 2,
-            db_auxiliary_pool_size: 5,
-            ..Config::default_for_test()
-        };
-        let budget = config.db_connection_budget();
-        assert_eq!(budget.available_connections, 90);
-        assert_eq!(budget.replica_connections, 40);
-        assert_eq!(budget.auxiliary_connections, 10);
-        assert_eq!(budget.required_connections, 50);
-        assert!(budget.is_within_limit());
-        config
-            .validate()
-            .expect("budget within limit must be accepted");
-    }
-
-    #[test]
-    fn db_budget_rejects_unsafe_replica_configuration() {
-        // 10 replicas x 20 connections = 200 > 100 - 10 available.
-        let config = Config {
-            db_server_max_connections: 100,
-            db_admin_headroom_connections: 10,
-            db_max_replicas: 10,
-            db_pool_size_per_replica: 20,
-            ..Config::default_for_test()
-        };
-        let error = config
-            .validate()
-            .expect_err("unsafe replica configuration must be rejected");
-        assert!(
-            matches!(
-                error,
-                ConfigError::InvalidValue {
-                    key: "PREDIFI_DB_MAX_REPLICAS",
-                    ..
-                }
-            ),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains("unsafe database connection budget"),
-            "expected actionable budget error, got: {error}"
-        );
-    }
-
-    #[test]
-    fn notification_provider_rejects_previous_key_equal_to_current() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_URL"),
-                String::from("https://notify.example.com"),
-            ),
-            (
-                String::from("PREDIFI_NOTIFICATION_PROVIDER_KEY"),
-                String::from("same-key"),
-            ),
-            (
-                String::from("PREDIFI_NOTI
-        );
-    }
-
-    #[test]
-    fn db_budget_rejects_unsafe_configuration_via_env() {
-        let vars = HashMap::from([
-            (
-                String::from("PREDIFI_DB_SERVER_MAX_CONNECTIONS"),
-                String::from("50"),
-            ),
-            (
-                String::from("PREDIFI_DB_ADMIN_HEADROOM_CONNECTIONS"),
-                String::from("5"),
-            ),
-            (String::from("PREDIFI_DB_MAX_REPLICAS"), String::from("10")),
-            (
-                String::from("PREDIFI_DB_POOL_SIZE_PER_REPLICA"),
-                String::from("10"),
-            ),
-        ]);
+    fn config_rejects_unsupported_contract_interface_version() {
+        let vars = HashMap::from([(
+            String::from(CONTRACT_INTERFACE_VERSION_ENV),
+            String::from("42"),
+        )]);
         assert!(matches!(
             Config::from_map(&vars),
             Err(ConfigError::InvalidValue {
-                key: "PREDIFI_DB_MAX_REPLICAS",
+                key: CONTRACT_INTERFACE_VERSION_ENV,
                 ..
             })
         ));
     }
 
     #[test]
-    fn notification_provider_rejects_non_boolean_dual_key_flag() {
-        let vars = HashMap::from([(
-            String::from("PREDIFI_NOTIFICATION_DUAL_KEY_ENABLED"),
-            String::from("maybe"),
+    fn config_rejects_empty_manifest_path() {
+        let vars = HashMap::from([(String::from(MANIFEST_PATH_ENV), String::new())]);
+        ass
         )]);
         assert!(matches!(
             Config::from_map(&vars),
@@ -3378,6 +3823,50 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_empty_manifest_path() {
+        let vars = HashMap::from([(String::from(MANIFEST_PATH_ENV), String::new())]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: MANIFEST_PATH_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn config_requires_contract_id_in_production() {
+        let vars = HashMap::from([
+            (String::from("PREDIFI_APP_ENV"), String::from("production")),
+            (
+                String::from("PREDIFI_SECRET_KEY"),
+                String::from("a-very-strong-production-secret-key-at-least-32-bytes"),
+            ),
+            (
+                String::from("PREDIFI_WS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
+            (
+                String::from("PREDIFI_CORS_ALLOWED_ORIGINS"),
+                String::from("https://app.predifi.com"),
+            ),
+        ]);
+        assert!(matches!(
+            Config::from_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: CONTRACT_ID_ENV,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn notification_provider_ignores_blank_previous_key() {
         let vars = HashMap::from([
             (
@@ -3401,7 +3890,6 @@ mod tests {
             })
         ));
     }
-
     #[test]
     fn notification_provider_ignores_blank_previous_key() {
         let vars = HashMap::from([
